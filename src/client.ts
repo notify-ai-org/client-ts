@@ -2,155 +2,27 @@
  * The SDK runtime: Bootstrapper, EventListener, InvokeManager, Dispatcher,
  * AcpServerClient and TokenHolder from the Java SDK in one client.
  */
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
-import { AcpClient, NotifyHTTPError, type RegistrationResponse } from "./acp.js";
 import { classModel, flatten, type ModelDef } from "./models.js";
-import { CredentialsInPayloadError, validateCredentialFree } from "./policy.js";
 import { Subject } from "./subjects.js";
-import {
-  EVENTS_TOPIC,
-  SCHEDULED_EVENTS_TOPIC,
-  type KafkaFactory,
-  type KafkaRecord,
-  type KafkaTransport,
-} from "./transport.js";
-import { hasBasicProfile, isPromiseLike, javaPartition, sleep, stringify, tenantIdFromToken } from "./util.js";
+import { callerFrames, hasBasicProfile, isAsyncFunction, isPromiseLike, javaPartition, ruleRecord, sleep, stringify, tenantIdFromToken } from "./util.js";
+import { AFTER, BEFORE, CallbackFn, Capture, RuleFn, SubjectSupplierFn, VocabularySupplierFn, When } from "./types.js";
+import { BufRecord, EventMeta, EventSchedule, EventSpec, Hook, Metrics, RuleSpec } from "./interfaces.js";
+import { consoleLogger, Logger } from "./logger.js";
+import { NotifyConfig } from "./config.js";
+import { EVENTS_TOPIC, KafkaFactory, KafkaRecord, KafkaTransport, SCHEDULED_EVENTS_TOPIC } from "./kafka.js";
+import { AcpClient, RegistrationResponse, NotifyHTTPError } from "./acp.js";
+import { validateCredentialFree, CredentialsInPayloadError } from "./policy.js";
 
-export interface Logger {
-  info(msg: string, ...args: unknown[]): void;
-  warn(msg: string, ...args: unknown[]): void;
-  error(msg: string, ...args: unknown[]): void;
-}
-
-/** Mirrors the Java NotifyProperties (prefix notify.ai.properties). */
-export interface NotifyConfig {
-  /** Default https://app.notify-ai.dev */
-  acpServerUrl?: string;
-  /** Default "notify-client" */
-  applicationName?: string;
-  /** Identifies this client to acp-server (sent as clientId at registration). */
-  clientToken?: string;
-  /** Reported at registration; for Node use the package name. */
-  basePackage?: string;
-  /** Max records per dispatch. Default 100. */
-  bufferBatchSize?: number;
-  /** Milliseconds between dispatcher drains. Default 100. */
-  flushIntervalMs?: number;
-  /** Cap on buffered records; the oldest capture is dropped when full. Default 10000; <0 = unbounded. */
-  maxBufferSize?: number;
-  /** Deliver captures over Kafka and consume scheduled events (requires `kafka`). */
-  kafkaEnabled?: boolean;
-  kafka?: KafkaFactory;
-  /** Flush buffered captures when the process is about to exit (beforeExit). Default true. */
-  flushOnExit?: boolean;
-  logger?: Logger;
-}
-
-/** NOTIFY_AI_* environment variables (same names as the Go and Python SDKs). */
-export function configFromEnv(env: NodeJS.ProcessEnv = process.env): NotifyConfig {
-  const num = (k: string) => (env[k] ? Number(env[k]) : undefined);
-  return {
-    acpServerUrl: env.NOTIFY_AI_ACP_SERVER_URL,
-    applicationName: env.NOTIFY_AI_APPLICATION_NAME,
-    clientToken: env.NOTIFY_AI_CLIENT_TOKEN,
-    basePackage: env.NOTIFY_AI_BASE_PACKAGE,
-    bufferBatchSize: num("NOTIFY_AI_BUFFER_BATCH_SIZE"),
-    flushIntervalMs: num("NOTIFY_AI_FLUSH_INTERVAL_MS"),
-    maxBufferSize: num("NOTIFY_AI_MAX_BUFFER_SIZE"),
-    kafkaEnabled: ["1", "true", "yes"].includes((env.NOTIFY_AI_KAFKA_ENABLED ?? "").toLowerCase()),
-  };
-}
-
-/** @Event attributes. */
-export interface EventSpec<P = unknown> {
-  key: string;
-  priority: number;
-  description?: string;
-  preferredTimeWindow?: string;
-  eventType?: string;
-  scheduleIntent?: string;
-  version?: string;
-  /** Vocabulary of the payload; without it object payloads flatten by their own keys. */
-  payload?: ModelDef<P>;
-  /** Service name reported with captures. Defaults to the class (decorator) or "default". */
-  serviceName?: string;
-}
-
-export interface RuleSpec {
-  name: string;
-  /** Empty applies the rule to every event ("*"). */
-  event?: string;
-  description?: string;
-}
-
-export type When = "BEFORE" | "AFTER";
-export const BEFORE: When = "BEFORE";
-export const AFTER: When = "AFTER";
-
-type MaybePromise<T> = T | Promise<T>;
-export type SubjectSupplierFn<P> = (payload: P) => MaybePromise<Subject[] | Subject | null | undefined>;
-export type RuleFn<P> = (payload: P) => unknown;
-export type CallbackFn<P> = (payload: P) => unknown;
-/** Receives the scheduled trigger from acp-server; returns the capture payload. */
-export type VocabularySupplierFn = (schedule: EventSchedule) => unknown;
-
-export interface EventSchedule {
-  id?: string;
-  eventName?: string;
-  description?: string;
-  triggerType?: string;
-  scheduledAt?: string | number;
-  cronExpression?: string;
-}
-
-export interface Metrics {
-  ruleInvokeCount: number;
-  vocabularySupplierInvokeCount: number;
-  subjectSupplierInvokeCount: number;
-  eventCaptureCount: number;
-  totalRuleInvokeMs: number;
-  totalVocabularySupplierMs: number;
-  totalSubjectSupplierMs: number;
-  droppedCaptureCount: number;
-}
-
-interface EventMeta {
-  spec: EventSpec<any>;
-  methodName: string;
-  declaringClassName: string;
-  serviceName: string;
-}
-
-interface Hook {
-  name: string;
-  event: string;
-  description: string;
-  fn: (payload: any) => unknown;
-}
-
-type RecordType = "VOCABULARY" | "RULE" | "EVENT_CAPTURE";
-interface BufRecord {
-  type: RecordType;
-  payload: any;
-}
-
-type Capture = Record<string, any>;
-
-const SDK_DIR = dirname(fileURLToPath(import.meta.url));
-const consoleLogger: Logger = {
-  info: (m, ...a) => console.info(`[notify] ${m}`, ...a),
-  warn: (m, ...a) => console.warn(`[notify] ${m}`, ...a),
-  error: (m, ...a) => console.error(`[notify] ${m}`, ...a),
-};
 
 export class NotifyClient {
   private readonly cfg: Required<Omit<NotifyConfig, "kafka" | "logger">>;
   private readonly log: Logger;
+ 
   private readonly acp: AcpClient;
-  private readonly kafkaFactory?: KafkaFactory;
+  
   private kafka?: KafkaTransport;
   private partitions = 0;
+  private readonly kafkaFactory?: KafkaFactory;
 
   private readonly events: EventMeta[] = [];
   private readonly models = new Map<string, ModelDef<any>>();
@@ -161,9 +33,16 @@ export class NotifyClient {
 
   private buffer: BufRecord[] = [];
   private readonly pending = new Set<Promise<void>>();
+
   private readonly metricsData: Metrics = {
-    ruleInvokeCount: 0, vocabularySupplierInvokeCount: 0, subjectSupplierInvokeCount: 0, eventCaptureCount: 0,
-    totalRuleInvokeMs: 0, totalVocabularySupplierMs: 0, totalSubjectSupplierMs: 0, droppedCaptureCount: 0,
+    ruleInvokeCount: 0, 
+    vocabularySupplierInvokeCount: 0, 
+    subjectSupplierInvokeCount: 0, 
+    eventCaptureCount: 0,
+    totalRuleInvokeMs: 0, 
+    totalVocabularySupplierMs: 0, 
+    totalSubjectSupplierMs: 0, 
+    droppedCaptureCount: 0,
   };
 
   private tokens: { access?: string; refresh?: string; header?: string; expiresAt: number } = { expiresAt: 0 };
@@ -304,7 +183,7 @@ export class NotifyClient {
       serviceName,
     };
     this.events.push(meta);
-    if (this.registered) this.add({ type: "EVENT_CAPTURE", payload: registerCapture(meta) });
+    if (this.registered) this.add({ type: "EVENT_CAPTURE", payload: this.registerCapture(meta) });
     return meta;
   }
 
@@ -374,7 +253,7 @@ export class NotifyClient {
             (e) => this.log.warn(`${when} callback for ${key} failed`, e),
           ));
         }
-      } catch (e) {
+      } catch (e : any) {
         this.log.warn(`${when} callback for ${key} failed`, e);
       }
     }
@@ -413,7 +292,7 @@ export class NotifyClient {
       capture.subjectResult = await this.subjectResult(meta.spec.key, payload);
       capture.ruleResults = await this.ruleResults(meta.spec.key, payload);
       this.enqueueCapture(capture);
-    } catch (e) {
+    } catch (e : any) {
       this.log.error(`failed to build capture for ${meta.spec.key}`, e);
     }
   }
@@ -426,7 +305,7 @@ export class NotifyClient {
     try {
       const out = await hook.fn(payload);
       const subjects = out == null ? [] : Array.isArray(out) ? out : [out];
-      validateSubjects(key, subjects);
+      this.validateSubjects(key, subjects);
       res.subjects = subjects;
     } catch (e) {
       res.success = false;
@@ -477,7 +356,7 @@ export class NotifyClient {
       try {
         const value = await hook.fn(schedule);
         if (value !== null && value !== undefined) capture.payload = flatten(value);
-      } catch (e) {
+      } catch (e : any) {
         this.log.warn(`vocabulary supplier for ${schedule.eventName} failed`, e);
       }
       this.metricsData.vocabularySupplierInvokeCount++;
@@ -485,6 +364,46 @@ export class NotifyClient {
     }
     this.enqueueCapture(capture);
   }
+
+    public async initKafka(onScheduled : (schedule: EventSchedule) => Promise<void>): Promise<void> {
+      if (!this.kafkaFactory) {
+        this.log.warn("kafkaEnabled is set but no kafka factory was supplied; using HTTP");
+        return;
+      }
+      let transport: KafkaTransport;
+      try {
+        transport = await this.kafkaFactory({
+          clientId: this.cfg.clientToken,
+          apiKey: this.registration.apiKey ?? "",
+          apiSecret: this.registration.apiSecret ?? "",
+        });
+        this.partitions = await transport.partitions(EVENTS_TOPIC);
+      } catch (e : any) {
+        this.log.error("Kafka transport unavailable; using HTTP", e);
+        return;
+      }
+      if (this.partitions <= 0) {
+        this.log.error(`${EVENTS_TOPIC} has no partitions; using HTTP`);
+        await transport.close();
+        return;
+      }
+      this.kafka = transport;
+      this.consumer = transport
+        .consume(SCHEDULED_EVENTS_TOPIC, async (value) => {
+          let schedule: EventSchedule;
+          try {
+            schedule = JSON.parse(value.toString("utf8"));
+          } catch (e : any) {
+            this.log.warn("invalid scheduled event", e);
+            return;
+          }
+          await onScheduled(schedule);
+        }, this.abort.signal)
+        .catch((e) => {
+          if (!this.abort.signal.aborted) this.log.error("scheduled-event consumer stopped", e);
+        });
+      this.log.info(`Kafka transport ready (${this.partitions} partitions)`);
+    }
 
   private add(record: BufRecord) {
     const max = this.cfg.maxBufferSize;
@@ -510,44 +429,24 @@ export class NotifyClient {
     if (this.closed) throw new Error("notify: client is closed");
     this.started = true;
     if (this.cfg.flushOnExit) process.once("beforeExit", this.onBeforeExit);
-    this.loop = this.run().catch((e) => this.log.error("dispatcher stopped", e));
+    this.loop = this.run(this.onScheduled).catch((e) => this.log.error("dispatcher stopped", e));
     return this;
   }
 
   /** Resolves when registration completes; rejects after timeoutMs. */
-  waitReady(timeoutMs = 30_000): Promise<void> {
-    return Promise.race([
-      this.readyPromise,
-      new Promise<void>((_, reject) => {
-        const t = setTimeout(() => reject(new Error("notify: registration timed out")), timeoutMs);
-        t.unref?.();
-        void this.readyPromise.then(() => clearTimeout(t));
-      }),
-    ]);
-  }
+  
 
   metrics(): Metrics {
     return { ...this.metricsData };
   }
 
-  /** Sends everything buffered, including captures still being built. */
-  async flush(timeoutMs = 10_000): Promise<void> {
-    if (!this.isReady) throw new Error("notify: not registered with acp-server yet");
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      if (Date.now() > deadline) throw new Error(`notify: ${this.buffer.length} record(s) not flushed`);
-      await Promise.all([...this.pending]);
-      await this.dispatchOnce();
-      if (this.buffer.length === 0 && this.pending.size === 0) return;
-    }
-  }
 
   /** Stops background work, flushes within timeoutMs, closes Kafka. */
   async close(timeoutMs = 10_000): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     process.removeListener("beforeExit", this.onBeforeExit);
-    this.abort.abort();
+    this.abort.abort  ();
     this.wake?.();
     await this.loop;
     await this.consumer;
@@ -558,10 +457,40 @@ export class NotifyClient {
       await this.kafka?.close();
     }
   }
+  
+  registerCapture(meta: EventMeta): Capture {
+    const s = meta.spec;
+    const event = {
+      name: s.key, description: s.description ?? "", priority: s.priority, scheduleIntent: s.scheduleIntent ?? "",
+      preferredTimeWindow: s.preferredTimeWindow ?? "", eventType: "REGISTER",
+    };
+    const now = new Date().toISOString();
+    return {
+      timestamp: now, occuredAt: now, event, durationMillis: 0, serviceName: meta.serviceName,
+      payload: {
+        EventMetadata: {
+          event, version: s.version, methodName: meta.methodName,
+          declaringClassName: meta.declaringClassName || meta.serviceName,
+          returnTypeName: "Object", parameterTypeNames: [s.payload?.className ?? "Object"],
+        },
+      },
+    };
+  }
 
-  private async run(): Promise<void> {
+  validateSubjects(key: string, subjects: unknown[]) {
+    subjects.forEach((s, i) => {
+      if (!(s instanceof Subject)) {
+        throw new Error(`SubjectSupplier for event '${key}' returned non-Subject item at index ${i}`);
+      }
+      if (!s.address || !String(s.address).trim()) {
+        throw new Error(`SubjectSupplier for event '${key}' returned ${s.channel} subject at index ${i} without a destination address`);
+      }
+    });
+  }
+
+  async run(onScheduled: (schedule: EventSchedule) => Promise<void>): Promise<void> {
     if (!(await this.registerWithRetry())) return;
-    if (this.cfg.kafkaEnabled) await this.initKafka();
+    if (this.cfg.kafkaEnabled) await this.initKafka(onScheduled);
     else this.log.info("Kafka disabled; event captures use HTTP transport");
     this.enqueueRegistrations();
     this.isReady = true;
@@ -587,13 +516,24 @@ export class NotifyClient {
           this.log.warn("registration response did not contain tokens");
         }
         return true;
-      } catch (e) {
+      } catch (e : any) {
         this.log.warn(`registration failed; retrying in ${backoff / 1000}s`, e instanceof Error ? e.message : e);
         if (!(await sleep(backoff, this.abort.signal))) return false;
         backoff = Math.min(backoff * 2, 60_000);
       }
     }
     return false;
+  }
+
+  waitReady(timeoutMs = 30_000): Promise<void> {
+    return Promise.race([
+      this.readyPromise,
+      new Promise<void>((_, reject) => {
+        const t = setTimeout(() => reject(new Error("notify: registration timed out")), timeoutMs);
+        t.unref?.();
+        void this.readyPromise.then(() => clearTimeout(t));
+      }),
+    ]);
   }
 
   private setTokens(access?: string, expiresInMs?: number, refresh?: string, header?: string) {
@@ -603,49 +543,10 @@ export class NotifyClient {
     this.tokens.expiresAt = expiresInMs && expiresInMs > 0 ? Date.now() + expiresInMs : Number.POSITIVE_INFINITY;
   }
 
-  private async initKafka() {
-    if (!this.kafkaFactory) {
-      this.log.warn("kafkaEnabled is set but no kafka factory was supplied; using HTTP");
-      return;
-    }
-    let transport: KafkaTransport;
-    try {
-      transport = await this.kafkaFactory({
-        clientId: this.cfg.clientToken,
-        apiKey: this.registration.apiKey ?? "",
-        apiSecret: this.registration.apiSecret ?? "",
-      });
-      this.partitions = await transport.partitions(EVENTS_TOPIC);
-    } catch (e) {
-      this.log.error("Kafka transport unavailable; using HTTP", e);
-      return;
-    }
-    if (this.partitions <= 0) {
-      this.log.error(`${EVENTS_TOPIC} has no partitions; using HTTP`);
-      await transport.close();
-      return;
-    }
-    this.kafka = transport;
-    this.consumer = transport
-      .consume(SCHEDULED_EVENTS_TOPIC, async (value) => {
-        let schedule: EventSchedule;
-        try {
-          schedule = JSON.parse(value.toString("utf8"));
-        } catch (e) {
-          this.log.warn("invalid scheduled event", e);
-          return;
-        }
-        await this.onScheduled(schedule);
-      }, this.abort.signal)
-      .catch((e) => {
-        if (!this.abort.signal.aborted) this.log.error("scheduled-event consumer stopped", e);
-      });
-    this.log.info(`Kafka transport ready (${this.partitions} partitions)`);
-  }
-
+  
   /** REGISTER captures, vocabulary, then rules — ahead of buffered captures. */
   private enqueueRegistrations() {
-    const records: BufRecord[] = this.events.map((e) => ({ type: "EVENT_CAPTURE", payload: registerCapture(e) }));
+    const records: BufRecord[] = this.events.map((e) => ({ type: "EVENT_CAPTURE", payload: this.registerCapture(e) }));
     if (this.models.size) records.push({ type: "VOCABULARY", payload: [...this.models.values()].map(classModel) });
     records.push(...this.rules.map(ruleRecord));
     this.buffer.unshift(...records);
@@ -668,7 +569,7 @@ export class NotifyClient {
         try {
           await this.dispatchOnce();
           backoff = 1000;
-        } catch (e) {
+        } catch (e : any) {
           this.log.error(`dispatch failed; retrying in ${backoff / 1000}s`, e instanceof Error ? e.message : e);
           if (!(await sleep(backoff, this.abort.signal))) return;
           backoff = Math.min(backoff * 2, 30_000);
@@ -773,68 +674,28 @@ export class NotifyClient {
       const resp = await this.acp.refreshToken({ clientId: this.clientId, refreshToken: this.tokens.refresh });
       this.setTokens(resp.token, resp.expiresInMs);
       this.log.info("access token refreshed");
-    } catch (e) {
+    } catch (e : any) {
       this.log.error("token refresh failed", e);
     }
   }
+
+  /** Sends everything buffered, including captures still being built. */
+  async flush(timeoutMs = 10_000): Promise<void> {
+    if (!this.isReady) throw new Error("notify: not registered with acp-server yet");
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (Date.now() > deadline) throw new Error(`notify: ${this.buffer.length} record(s) not flushed`);
+      await Promise.all([...this.pending]);
+      await this.dispatchOnce();
+      if (this.buffer.length === 0 && this.pending.size === 0) return;
+    }
+  }
+    
 }
 
-const isAsyncFunction = (fn: unknown): boolean =>
-  typeof fn === "function" && fn.constructor?.name === "AsyncFunction";
 
-function ruleRecord(hook: Hook): BufRecord {
-  return { type: "RULE", payload: { eventName: hook.event, ruleName: hook.name, ruleDescription: hook.description } };
-}
 
 /** REGISTER capture; payload matches the Java SDK's flattened EventMetadata. */
-function registerCapture(meta: EventMeta): Capture {
-  const s = meta.spec;
-  const event = {
-    name: s.key, description: s.description ?? "", priority: s.priority, scheduleIntent: s.scheduleIntent ?? "",
-    preferredTimeWindow: s.preferredTimeWindow ?? "", eventType: "REGISTER",
-  };
-  const now = new Date().toISOString();
-  return {
-    timestamp: now, occuredAt: now, event, durationMillis: 0, serviceName: meta.serviceName,
-    payload: {
-      EventMetadata: {
-        event, version: s.version, methodName: meta.methodName,
-        declaringClassName: meta.declaringClassName || meta.serviceName,
-        returnTypeName: "Object", parameterTypeNames: [s.payload?.className ?? "Object"],
-      },
-    },
-  };
-}
 
-function validateSubjects(key: string, subjects: unknown[]) {
-  subjects.forEach((s, i) => {
-    if (!(s instanceof Subject)) {
-      throw new Error(`SubjectSupplier for event '${key}' returned non-Subject item at index ${i}`);
-    }
-    if (!s.address || !String(s.address).trim()) {
-      throw new Error(`SubjectSupplier for event '${key}' returned ${s.channel} subject at index ${i} without a destination address`);
-    }
-  });
-}
 
-/** Up to 5 application frames from a stack trace, skipping the SDK. */
-function callerFrames(limit = 5): Capture[] {
-  const stack = new Error().stack?.split("\n").slice(1) ?? [];
-  const frames: Capture[] = [];
-  for (const line of stack) {
-    if (frames.length >= limit) break;
-    const m = line.match(/^\s*at (?:(.+?) \()?(.+?):(\d+):\d+\)?$/);
-    if (!m) continue;
-    const file = m[2].replace(/^file:\/\//, "");
-    if (file.startsWith(SDK_DIR) || file.startsWith("node:")) continue;
-    const fn = (m[1] ?? "<anonymous>").replace(/^async /, "");
-    const dot = fn.lastIndexOf(".");
-    frames.push({
-      className: dot > 0 ? fn.slice(0, dot) : "",
-      methodName: dot > 0 ? fn.slice(dot + 1) : fn,
-      lineNumber: Number(m[3]),
-      fileName: file,
-    });
-  }
-  return frames;
-}
+

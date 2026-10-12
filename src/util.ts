@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { Hook, BufRecord } from "./interfaces.js";
+import { Capture } from "./types.js";
+import { SDK_DIR } from "./config.js";
 
 export const newUUID = (): string => randomUUID();
 
@@ -72,6 +75,36 @@ export const sleep = (ms: number, signal?: AbortSignal): Promise<boolean> =>
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+
+
+  /** Up to 5 application frames from a stack trace, skipping the SDK. */
+export function callerFrames(limit = 5): Capture[] {
+  const stack = new Error().stack?.split("\n").slice(1) ?? [];
+  const frames: Capture[] = [];
+  for (const line of stack) {
+    if (frames.length >= limit) break;
+    const m = line.match(/^\s*at (?:(.+?) \()?(.+?):(\d+):\d+\)?$/);
+    if (!m) continue;
+    const file = m[2].replace(/^file:\/\//, "");
+    if (file.startsWith(SDK_DIR) || file.startsWith("node:")) continue;
+    const fn = (m[1] ?? "<anonymous>").replace(/^async /, "");
+    const dot = fn.lastIndexOf(".");
+    frames.push({
+      className: dot > 0 ? fn.slice(0, dot) : "",
+      methodName: dot > 0 ? fn.slice(dot + 1) : fn,
+      lineNumber: Number(m[3]),
+      fileName: file,
+    });
+  }
+  return frames;
+}
+
+export const isAsyncFunction = (fn: unknown): boolean =>
+  typeof fn === "function" && fn.constructor?.name === "AsyncFunction";
+
+export function ruleRecord(hook: Hook): BufRecord {
+  return { type: "RULE", payload: { eventName: hook.event, ruleName: hook.name, ruleDescription: hook.description } };
+}
 
 export const isPromiseLike = (v: unknown): v is PromiseLike<unknown> =>
   !!v && (typeof v === "object" || typeof v === "function") && typeof (v as PromiseLike<unknown>).then === "function";
